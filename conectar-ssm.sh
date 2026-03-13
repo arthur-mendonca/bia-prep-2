@@ -1,6 +1,6 @@
 # 1. Obter o ID da instância rodando com o nome 'bia-dev'
 INSTANCE_ID=$(aws ec2 describe-instances \
-    --filters "Name=tag:Name,Values=ECS Instance - cluster-bia" "Name=instance-state-name,Values=running" \
+    --filters "Name=tag:Name,Values=ECS Instance - bia-cluster-alb" "Name=instance-state-name,Values=running" \
     --query "Reservations[0].Instances[0].InstanceId" --output text)
 
 # 2. Exibir o ID (para conferência)

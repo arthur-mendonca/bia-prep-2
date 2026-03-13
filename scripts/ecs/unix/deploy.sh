@@ -10,8 +10,8 @@ set -euo pipefail
 # Configurações padrão
 DEFAULT_REGION="us-east-1"
 DEFAULT_ECR_REPO="bia"
-DEFAULT_CLUSTER="cluster-bia"
-DEFAULT_SERVICE="task-def-bia-service-f2a8ndus"
+DEFAULT_CLUSTER="bia-cluster-alb"
+DEFAULT_SERVICE="task-def-bia-alb-service-73i73cp2"
 
 # Cores para output
 RED='\033[0;31m'
