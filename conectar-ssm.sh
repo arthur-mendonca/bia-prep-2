@@ -9,4 +9,6 @@ echo "Conectando à instância: $INSTANCE_ID"
 # 3. Iniciar a sessão SSM
 aws ssm start-session --target $INSTANCE_ID
 
-# senha DB J73Fe3CfbivjskRzwX2X
+
+# hVhAA0h5riqCRW6qGaie
+# bia-db-postgres.cursmugyih4x.us-east-1.rds.amazonaws.com

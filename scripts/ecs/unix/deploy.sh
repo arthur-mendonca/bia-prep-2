@@ -5,13 +5,13 @@
 # Este script automatiza o processo de build e deploy para ECS
 # com versionamento baseado em commit hash para facilitar rollbacks
 
-set -e  # Para o script em caso de erro
+set -euo pipefail
 
 # Configurações padrão
 DEFAULT_REGION="us-east-1"
 DEFAULT_ECR_REPO="bia"
 DEFAULT_CLUSTER="cluster-bia"
-DEFAULT_SERVICE="service-bia"
+DEFAULT_SERVICE="task-def-bia-service-f2a8ndus"
 
 # Cores para output
 RED='\033[0;31m'
@@ -93,7 +93,7 @@ ecr_login() {
     local region=$1
     local account_id=$2
     log_info "Fazendo login no ECR..."
-    aws ecr get-login-password --region $region | docker login --username AWS --password-stdin $account_id.dkr.ecr.$region.amazonaws.com
+    aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$account_id.dkr.ecr.$region.amazonaws.com"
 }
 
 # Função para fazer build e push da imagem
@@ -109,18 +109,22 @@ build_and_push() {
     log_info "Tags: latest, $commit_hash"
     
     # Build
-    docker build --platform linux/amd64 -t $repo_name:latest -t $repo_name:$commit_hash . >&2
+    docker build --platform linux/amd64 -t "$repo_name:latest" -t "$repo_name:$commit_hash" . >&2
     
     # Tag para ECR
-    docker tag $repo_name:latest $ecr_uri:latest >&2
-    docker tag $repo_name:$commit_hash $ecr_uri:$commit_hash >&2
+    docker tag "$repo_name:latest" "$ecr_uri:latest" >&2
+    docker tag "$repo_name:$commit_hash" "$ecr_uri:$commit_hash" >&2
     
     log_info "Fazendo push para ECR: $ecr_uri"
-    docker push $ecr_uri:latest >&2
-    docker push $ecr_uri:$commit_hash >&2
+    docker push "$ecr_uri:latest" >&2
+    docker push "$ecr_uri:$commit_hash" >&2
+
+    log_info "Verificando tags no ECR..."
+    aws ecr describe-images --region "$region" --repository-name "$repo_name" --image-ids imageTag=latest > /dev/null
+    aws ecr describe-images --region "$region" --repository-name "$repo_name" --image-ids imageTag="$commit_hash" > /dev/null
     
     log_success "Build e Push concluídos com sucesso"
-    echo "$ecr_uri:$commit_hash"
+    echo "$ecr_uri:latest"
 }
 
 # Função para criar nova task definition e atualizar serviço
@@ -134,7 +138,7 @@ update_ecs_service() {
     
     # 1. Obter a task definition atual do serviço
     log_info "Obtendo task definition atual..."
-    local task_def_arn=$(aws ecs describe-services --cluster $cluster --services $service --region $region --query "services[0].taskDefinition" --output text)
+    local task_def_arn=$(aws ecs describe-services --cluster "$cluster" --services "$service" --region "$region" --query "services[0].taskDefinition" --output text)
     
     if [ "$task_def_arn" == "None" ]; then
         log_error "Serviço $service não encontrado ou sem task definition"
@@ -142,22 +146,29 @@ update_ecs_service() {
     fi
     
     # 2. Baixar a definição JSON
-    local current_task_json=$(aws ecs describe-task-definition --task-definition $task_def_arn --region $region --query "taskDefinition" --output json)
+    local current_task_json=$(aws ecs describe-task-definition --task-definition "$task_def_arn" --region "$region" --query "taskDefinition" --output json)
     
     # 3. Criar nova definição com a nova imagem
     # Removemos campos que não podem ser enviados no register-task-definition (status, revision, etc)
     log_info "Criando nova revisão da Task Definition..."
-    local new_task_json=$(echo $current_task_json | jq --arg image "$image_uri" '
-        .containerDefinitions[0].image = $image |
+    local new_task_json=$(echo "$current_task_json" | jq --arg image "$image_uri" '
+        if (.containerDefinitions | length) == 1 then
+            .containerDefinitions[0].image = $image
+        elif any(.containerDefinitions[]; .name == "bia-container") then
+            (.containerDefinitions[] | select(.name == "bia-container") | .image) = $image
+        else
+            .containerDefinitions[0].image = $image
+        end |
         del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
     ')
     
     # Salvar em arquivo temporário
-    echo $new_task_json > new-task-def.json
+    local tmp_task_def_file=$(mktemp)
+    echo "$new_task_json" > "$tmp_task_def_file"
     
     # 4. Registrar nova task definition
-    local new_task_def_arn=$(aws ecs register-task-definition --region $region --cli-input-json file://new-task-def.json --query "taskDefinition.taskDefinitionArn" --output text)
-    rm new-task-def.json
+    local new_task_def_arn=$(aws ecs register-task-definition --region "$region" --cli-input-json file://"$tmp_task_def_file" --query "taskDefinition.taskDefinitionArn" --output text)
+    rm -f "$tmp_task_def_file"
     
     if [ -z "$new_task_def_arn" ] || [ "$new_task_def_arn" == "None" ]; then
         log_error "Falha ao registrar nova Task Definition"
@@ -168,9 +179,22 @@ update_ecs_service() {
     
     # 5. Atualizar o serviço
     log_info "Atualizando serviço $service no cluster $cluster..."
-    aws ecs update-service --cluster $cluster --service $service --task-definition $new_task_def_arn --force-new-deployment --region $region > /dev/null
-    
-    log_success "Serviço atualizado! O deployment está em andamento."
+    aws ecs update-service --cluster "$cluster" --service "$service" --task-definition "$new_task_def_arn" --force-new-deployment --region "$region" > /dev/null
+
+    log_info "Aguardando o serviço estabilizar..."
+    if ! aws ecs wait services-stable --cluster "$cluster" --services "$service" --region "$region"; then
+        log_error "O serviço não estabilizou. Eventos recentes:"
+        aws ecs describe-services --cluster "$cluster" --services "$service" --region "$region" --query "services[0].events[0:10].message" --output text >&2 || true
+
+        local stopped_task_arn=$(aws ecs list-tasks --cluster "$cluster" --service-name "$service" --desired-status STOPPED --region "$region" --query "taskArns[0]" --output text || true)
+        if [ -n "$stopped_task_arn" ] && [ "$stopped_task_arn" != "None" ]; then
+            log_error "Último task STOPPED: $stopped_task_arn"
+            aws ecs describe-tasks --cluster "$cluster" --tasks "$stopped_task_arn" --region "$region" --query "tasks[0].containers[*].reason" --output text >&2 || true
+        fi
+        exit 1
+    fi
+
+    log_success "Serviço atualizado e estabilizado."
 }
 
 # Função principal de deploy
@@ -187,6 +211,11 @@ deploy() {
             exit 1
         fi
     done
+
+    if ! docker info > /dev/null 2>&1; then
+        log_error "Docker daemon não está acessível. Inicie o Docker Desktop (ou Colima) antes do deploy."
+        exit 1
+    fi
     
     local commit_hash=$(get_commit_hash)
     local account_id=$(aws sts get-caller-identity --query Account --output text)
@@ -201,6 +230,11 @@ deploy() {
     
     # Build & Push
     local image_uri=$(build_and_push $region $ecr_repo $commit_hash $account_id)
+
+    if ! aws ecr describe-images --region "$region" --repository-name "$ecr_repo" --image-ids imageTag=latest > /dev/null 2>&1; then
+        log_error "A tag latest não existe no ECR ($ecr_repo). Abortando antes de atualizar o ECS."
+        exit 1
+    fi
     
     # Deploy ECS
     update_ecs_service $region $cluster $service $image_uri

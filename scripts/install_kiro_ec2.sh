@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-INSTANCE_ID="i-0468687d753fd33c1"
+INSTANCE_ID="i-0cda46d7eadb76c64"
 
 echo "Installing Kiro CLI on instance $INSTANCE_ID for ec2-user..."
 
